@@ -1,0 +1,8 @@
+catlas_base: 'SRR1976948'
+input_sequences:
+- data/khmer/SRR1976948_1.fastq
+ksize: 31
+radius: 1
+search:
+- data/genomes/GCA_001508995.1_ASM150899v1_genomic.fna.gz
+searchquick: data/genomes/GCA_001508995.1_ASM150899v1_genomic.fna.gz
