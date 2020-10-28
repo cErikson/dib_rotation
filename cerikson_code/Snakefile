@@ -1,1 +1,223 @@
-../Snakefile
+import os
+
+## CONFIG ##
+config={
+	"accessions":["SRR1976948"],
+	"sgc_search":["GCA_001508995.1_ASM150899v1_genomic.fna.gz"]
+	}
+
+## DEFINE WORKDIR ##
+WORKDIR=workflow.basedir+'/'
+
+##### SETUP #####
+
+
+
+rule get_fastq_pe:
+    output:
+        # the wildcard name must be accession, pointing to an SRA number
+        "data/reads/{accession}_1.fastq",
+        "data/reads/{accession}_2.fastq"
+    threads: 6  # defaults to 6
+    shell:
+        '''
+        fasterq-dump -p -S -e {threads} --outdir data/reads/ {wildcards.accession}
+	'''
+
+rule download:
+    input:
+        expand("data/reads/{id}_1.fastq", id=config["accessions"]),
+        expand("data/reads/{id}_2.fastq", id=config["accessions"])
+	
+rule fastqc:
+    input:
+        "data/{step}/{sample}.fastq"
+    output:
+        html="data/qc/fastqc/{step}/{sample}.html",
+        zip="data/qc/fastqc/{step}/{sample}_fastqc.zip" # the suffix _fastqc.zip is necessary for multiqc to find the file. If not using multiqc, you are free to choose an arbitrary filename
+    params: ""
+    log:
+        "logs/fastqc/{step}/{sample}.log"
+    threads: 1
+    wrapper:
+        "0.66.0/bio/fastqc"
+
+rule multiqc:
+    input:
+        expand("data/qc/fastqc/{{step}}/{sample}_1_fastqc.zip", sample=config["accessions"]),
+        expand("data/qc/fastqc/{{step}}/{sample}_2_fastqc.zip", sample=config["accessions"])
+    output:
+        "qc/{step}/multiqc.html"
+    params:
+        ""  # Optional: extra parameters for multiqc.
+    log:
+        "logs/{step}/multiqc.log"
+    wrapper:
+        "0.66.0/bio/multiqc"
+
+rule cutadapt:
+    input:
+        ["data/reads/{sample}_1.fastq", "data/reads/{sample}_2.fastq"]
+    output:
+        fastq1="data/trimmed/{sample}_1.fastq",
+        fastq2="data/trimmed/{sample}_2.fastq",
+        qc="data/qc/trimmed/{sample}.qc.txt"
+    params:
+        adapters = "-a AGAGCACACGTCTGAACTCCAGTCAC -g AGATCGGAAGAGCACACGT -A AGAGCACACGTCTGAACTCCAGTCAC -G AGATCGGAAGAGCACACGT",
+        # https://cutadapt.readthedocs.io/en/stable/guide.html#
+        others = "-o=5 --minimum-length 25 --max-expected-errors 10 -q 20"
+    log:
+        "logs/cutadapt/{sample}.log"
+    threads: 4 # set desired number of threads here
+    wrapper:
+        "0.66.0/bio/cutadapt/pe"
+
+rule khmer:
+    input:
+        read1="data/trimmed/{sample}_1.fastq",
+        read2="data/trimmed/{sample}_2.fastq",
+    output:
+        "data/khmer/{sample}_1.fastq"
+    shell:
+        '''
+	interleave-reads.py {input.read1} {input.read2} | trim-low-abund.py -C 3 -Z 18 -M 20e9 -V - -o {output}
+	'''
+
+ruleorder: sourmash_reads_pe > sourmash_reads_se
+
+rule sourmash_reads_se:
+    input:
+        "data/{step}/{sample}_1.fastq"
+    output:
+        "data/sour/{step}/sig/{sample}.sig"
+    log:
+        "logs/sourmash/{step}_{sample}_compute_reads.log"
+    threads: 12
+    params:
+        # optional parameters
+        k = "21,31,51",
+        scaled = "2000",
+        extra = "--track-abundance"
+    shell:
+        '''
+	sourmash compute -o {output} --scaled {params.scaled} -k {params.k} {params.extra} {input}
+	'''
+
+rule sourmash_reads_pe:
+    input:
+        read1="data/{step}/{sample}_1.fastq",
+	read2="data/{step}/{sample}_2.fastq"
+    output:
+        "data/sour/{step}/sig/{sample}.sig"
+    log:
+        "logs/sourmash/{step}_{sample}_compute_reads.log"
+    threads: 12
+    params:
+        # optional parameters
+        k = "21,31,51",
+        scaled = "2000",
+        extra = "--track-abundance"
+    shell:
+        '''
+	sourmash compute -o {output} --merge {wildcards.sample} --scaled {params.scaled} -k {params.k} {params.extra} {input.read1} {input.read2}
+	'''
+
+rule sourmash_lca_db:
+     output:
+         "data/sour/genbank-k31.lca.json"
+     log:
+         "logs/sourmash/download.log"
+     shell:
+         '''
+	 curl -L https://osf.io/4f8n3/download -o data/sour/genbank-k31.lca.json.gz 2> {log}
+         gunzip data/sour/genbank-k31.lca.json.gz
+	 '''
+
+rule sourmash_lca:
+     input:
+         db="data/sour/genbank-k31.lca.json",
+         sig="data/sour/{step}/sig/{sample}.sig"
+     output:
+         "data/sour/lca/{step}_{sample}_lca_gather.csv"
+     log:
+         "logs/sourmash/{step}_{sample}_lca_gather.log"
+     shell:
+         '''
+	 sourmash lca gather -o {output} {input.sig} {input.db} 1> {log} 2>&1
+	 '''
+
+rule sgc_se:
+    input:
+        fasta="data/{step}/{sample}_1.fastq",
+        conf="data/sgc/conf1.yaml"
+    output:
+        "data/sgc/{step}/{sample}"
+    shell:
+        '''
+	cd data/sgc/{wildcards.step}/{wildcards.sample}
+        spacegraphcats ../../conf1.yaml extract_contigs extract_reads --nolock
+        '''
+rule plass:
+    input:
+        ref="data/sgc/{sample}_search_oh0/{search}_genomic.fna.gz",
+    output:
+        query="data/plass/{sample}/{search}_nbhd_plass.cdhit.fa"
+    shell:
+        '''
+        plass assemble {input.ref} {input.ref}.stared tmp
+	sed 's/\*//g' < {input.ref}.stared > {input.ref}.nonstar
+	cd-hit -c 1 -i {input.ref}.nonstar -o  query_nbhd_plass.cdhit.fa
+	'''
+
+rule blast_plass:
+    input:
+        query="data/plass/{sample}/{search}_nbhd_plass.cdhit.fa",
+	sub="data/protien/{search}_protein.faa"
+    output:
+        "data/blast/{sample}/{search}_query_nbhd_blast.tab"
+    shell:
+        '''
+        blastp -query {input.query} -subject {input.sub} -outfmt 6 -out {output}
+	'''
+
+rule kofamscan_plass:
+    input:
+        "data/plass/{sample}/{search}_nbhd_plass.cdhit.fa"
+    output:
+        "data/kofamscan/{sample}/{search}_kofamscan.txt"
+    shell:
+        '''
+        exec_annotation -f mapper -o {output} {input}
+        ''' 
+
+rule kofamscan_prot:
+    input:
+        "data/protien/{search}_protien.faa"
+    output:
+        "data/kofamscan/protien/{search}_kofamscan.txt"
+    shell:
+        '''
+        exec_annotation -f mapper -o {output} {input}
+        ''' 
+
+rule cat_kofamscan:
+    input:
+        prot="data/kofamscan/protien/{search}_kofamscan.txt",
+        nbhd="data/kofamscan/{sample}/{search}_kofamscan.txt"
+    output:
+        "data/keggdecoder/kodata/{sample}_{search}_kofamscan.txt"
+    shell:
+        '''
+        cat {input.prot) | sed -ne 's/.*/{wildcard.search}_&/p' > {output}
+        cat {input.nbhd} | sed -ne 's/.*/{wildcard.sample}_&/p' >> {output} 
+        '''
+
+rule keggdecoder:
+    input:
+        "data/keggdecoder/kodata/{sample}_{search}_kofamscan.txt"
+    output:
+        "data/keggdecoder/{sample}/{search}/kegg-decoder.svg"
+    shell:
+        '''
+        KEGG-decoder -i {input} -o data/keggdecoder/{wildcard.sample}/{wildcard.search}/kegg-decoder --vizoption static
+        '''
